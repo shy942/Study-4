@@ -3,18 +3,17 @@ import base64
 import requests
 import os
 import glob
+import sys
+import shutil
 
 
-prompt = "Provide a detailed plain text descriptive paragraph of this image. Then, give an exact plain text monospaced transcript of any and all text in the image."
-
-base_dir = './1'
-directories_to_process = 'groundtruthFound_imgui.txt'
 image_extensions = ['*.jpg', '*.JPG',  '*.png', '*.PNG']
+prompt = "Provide a single detailed plain text descriptive paragraph of this image. Then, give an exact plain text monospaced transcript of any and all text in the image."
 
 api_key = 'YOUR_API_KEY'
 model = 'gpt-4o'
 api_url = 'https://api.openai.com/v1/chat/completions'
-max_tokens = 1000
+max_tokens = 2500
 
 
 
@@ -69,10 +68,6 @@ def write_to_files(image_info, input_string):
     description_path = os.path.join(image_info['dir_path'], f"{image_info['file_name']}ImageDescription.txt")
     content_path = os.path.join(image_info['dir_path'], f"{image_info['file_name']}ImageContent.txt")
     
-    if not image_description.strip() or not image_text_transcript.strip():
-        print(f"\n\nPotential error. Check txt's at {image_info['dir_path']}. Unformatted output is below.\n")
-        print(f"{input_string}\n\n")
-    
     with open(description_path, 'w') as file:
         file.write(image_description)
     with open(content_path, 'w') as file:
@@ -119,12 +114,14 @@ def send_images_to_api(images_info):
             print(f"Wrote .txt's in {dir_path}")
 
         except requests.exceptions.RequestException as e:
-            print(f"Error with sending image to API in {dir_path} upload: {e}")
+            print(f"Error sending {image_info['file_name']} image to API located in {dir_path}: \n{e}")
+            errored_requests.append(image_info)
+            
 
 
 
-# find all images to be processed and encode them
-def process_and_encode_images(base_directory, image_extensions, directories_to_process):
+# find all images to be processed for a project and encode them
+def process_and_encode_images(base_directory, directories_to_process):
     encoded_images = []
     dir_count = 0
 
@@ -154,20 +151,121 @@ def process_and_encode_images(base_directory, image_extensions, directories_to_p
                         encoded_images.append(image_info)
     
     not_found = allowed_dirs - found_dirs
+    
     if not_found:
-        print(f"Directories not found: {not_found}")
+        print(f"Creating missing bug report txt for the following directories not found: {not_found}")
+        
+        file_path = f"{base_directory}/missing_bug_reports.txt"
+        with open(file_path, "w") as file:
+            file.write("Following bug reports are not found:\n")
+            for item in not_found:
+                 file.write(f"{item}\n")
 
     return encoded_images, dir_count
 
 
 
-images_info, dir_count = process_and_encode_images(base_dir, image_extensions, directories_to_process)
-print(f"Searched {dir_count} directories and found {len(images_info)} images, send each to OpenAI API?")
+# remove all directories from a specified path except the ones listed in a txt
+def keep_only_listed_directories(base_directory, list_file):
+    with open(list_file, 'r') as file:
+        keep_dirs = {line.strip() for line in file}
 
-user_input = input("(y/n): ")
-if user_input.lower() != 'y':
-    exit()
+    all_dirs = {name for name in os.listdir(base_directory) if os.path.isdir(os.path.join(base_directory, name))}
 
-send_images_to_api(images_info)
+    dirs_to_delete = all_dirs - keep_dirs
+
+    for dir_name in dirs_to_delete:
+        dir_path = os.path.join(base_directory, dir_name)
+        shutil.rmtree(dir_path)
+
+    return len(dirs_to_delete)
+
+
+
+# each line of 2 items in a csv becomes a dictionary, a list of all dictionaries are returned
+def parse_csv(file_path):
+    all_projects = []
+    
+    try:
+        with open(file_path, 'r') as file:
+            for line in file:
+                line = line.strip()
+                parts = line.split(',')
+
+                if len(parts) == 2:
+                    project_dict = {'project': parts[0], 'identifier': parts[1]}
+                    all_projects.append(project_dict)
+                else:
+                    raise ValueError("Each line must contain exactly two items separated by a comma.")
+    
+    except Exception as e:
+        print(f"Failed to read or parse the file: {e}")
+        exit(1)
+    
+    return all_projects
+
+
+
+# loop through each project specified in the csv, sending the specified images to the api
+errored_requests = []
+def main(projects_dir, txts_dir, csv_path):
+    
+    all_projects = parse_csv(csv_path)
+    
+    for project in all_projects:
+        project_path = os.path.join(projects_dir, project['project'])
+        
+        match_count = 0
+        txt_file_path = None
+        for txt_file in os.listdir(txts_dir):
+            if project['identifier'] in txt_file:
+                match_count += 1
+                txt_file_path = os.path.join(txts_dir, txt_file)
+
+        if txt_file_path and match_count == 1:
+
+            number_removed = keep_only_listed_directories(project_path, txt_file_path)
+            print(f"Removed {number_removed} unecessary directories from project {project['project']}")
+
+            images_info, dir_count = process_and_encode_images(project_path, txt_file_path)
+            print(f"Searched {dir_count} directories in project {project['project']} using identifier {project['identifier']}")
+            print(f"Found {len(images_info)} images - sending each to OpenAI API")
+            send_images_to_api(images_info)
+
+        elif not txt_file_path:
+            print(f"No matching txt file found for identifier {project['identifier']} in {txts_dir}")
+        else:
+            print(f"txt identifier {project['identifier']} not unique enough: {match_count} files detected")
+
+
+    while len(errored_requests) > 0:
+        print(f"There were {len(errored_requests)} errored requests. Do you want to try sending them again? (y/n)")
+        user_input = input().strip().lower()
+        
+        if user_input == 'y':
+
+            images_info = errored_requests.copy()
+            errored_requests.clear()
+            send_images_to_api(images_info)
+
+        else:
+            break
+
+
+
+# verify 3 command line arguments
+if __name__ == "__main__":
+    
+    if len(sys.argv) == 4:
+        projects_dir = sys.argv[1]
+        txts_dir = sys.argv[2]
+        csv_path = sys.argv[3]
+    
+    else:
+        print("Usage: python process_images_with_api.py <images_dir> <txts_dir> <csv_path>")
+        sys.exit(1)
+    
+    main(projects_dir, txts_dir, csv_path)
+
 
 
